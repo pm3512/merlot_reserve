@@ -10,6 +10,9 @@ from PIL import Image
 import numpy as np
 from io import BytesIO
 import random
+from dotenv import load_dotenv
+
+load_dotenv("../")
 
 encoder = get_encoder()
 
@@ -170,7 +173,7 @@ def create_base_parser():
     parser.add_argument(
         '-base_fn',
         dest='base_fn',
-        default='gs://replace_with_your_path/',
+        default=os.environ["TFRECORDS_PATH"],
         type=str,
         help='Base filename to use. You can start this with gs:// and we\'ll put it on google cloud.'
     )

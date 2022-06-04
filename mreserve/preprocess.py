@@ -137,7 +137,7 @@ def make_spectrogram(waveform, playback_speed=1, sr=22050, pad_size=2):
         'fmax': 11025.0,  # Half the sample rate
     }
     eps = 1e-1
-    mel = librosa.feature.melspectrogram(waveform, **librosa_params)
+    mel = librosa.feature.melspectrogram(y=waveform, **librosa_params)
     log_mel = np.log(mel + eps) - np.log(eps)
 
     # Tack on playback speed as a (constant) feature

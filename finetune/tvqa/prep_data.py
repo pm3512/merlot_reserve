@@ -33,88 +33,23 @@ from mreserve.lowercase_encoder import START
 import pysrt
 from unidecode import unidecode
 import ftfy
+from dotenv import load_dotenv
 
+load_dotenv('../../.env')
 
 parser = create_base_parser()
-parser.add_argument(
-    '-data_dir',
-    dest='data_dir',
-    default='/home/rowan/datasets3/tvqa/',
-    type=str,
-    help='Image directory.'
-)
-"""
-Must set things up like this in the data_dir
-drwxr-xr-x 1 rowan rowan    1155072 Aug 19  2018 tvqa_subtitles
-drwxr-xr-x 1 rowan rowan       4096 Aug 27  2018 tvqa_qa_release
-drwxr-xr-x 1 rowan rowan       4096 Jan 18  2020 tvqa_plus_annotations_with_test
-drwxrwxr-x 1 rowan rowan       4096 Sep 14 08:06 tvqa_frames
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.aa
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ab
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ac
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ad
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ae
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.af
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ag
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ah
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ai
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.aj
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ak
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.al
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.am
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.an
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ao
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ap
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.aq
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ar
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.as
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.at
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.au
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.av
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.aw
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ax
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ay
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.az
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.ba
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bb
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bc
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bd
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.be
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bf
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bg
--rw-rw-r-- 1 rowan rowan 4294967296 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bh
--rw-rw-r-- 1 rowan rowan  761207798 Nov 12  2018 tvqa_video_frames_fps3_hq.tar.gz.bi
--rw-rw-r-- 1 rowan rowan       2450 Nov 25  2018 tvqa_video_frames_fps3_hq.checksum.txt
--rw-r--r-- 1 rowan rowan    4061313 Apr 22  2019 tvqa_plus_val.json
--rw-r--r-- 1 rowan rowan   31270388 Apr 22  2019 tvqa_plus_train.json
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.aa
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.ab
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.ac
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.ad
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.ae
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.af
--rw-rw-r-- 1 rowan rowan 4294967296 Apr 29  2019 tvqa_audios.tar.gz.ag
--rw-rw-r-- 1 rowan rowan 2750112255 Apr 29  2019 tvqa_audios.tar.gz.ah
--rw-rw-r-- 1 rowan rowan        448 Apr 29  2019 tvqa_audios.checksum.txt
--rw-rw-r-- 1 rowan rowan   15495443 Jul 23  2019 tvqa_subtitles.tar.gz
--rw-rw-r-- 1 rowan rowan   14474003 Jul 23  2019 tvqa_qa_release.tar.gz
--rw-rw-r-- 1 rowan rowan    6718915 Jul 23  2019 tvqa_plus_annotations.tar.gz
--rw-rw-r-- 1 rowan rowan       6899 Nov 11  2019 tvqa_dl_instructions.txt
--rw-rw-r-- 1 rowan rowan   47577821 Nov 11  2019 subs.pkl
--rw-rw-r-- 1 rowan rowan    7323926 Jan 19  2020 tvqa_plus_annotations_preproc_with_test.tar.gz
-"""
 
 args = parser.parse_args()
 random.seed(args.seed)
 
-out_fn = os.path.join(args.base_fn, 'tvqa', '{}{:03d}of{:03d}.tfrecord'.format(args.split, args.fold, args.num_folds))
+out_fn = os.path.join(os.environ["TFRECORDS_PATH"], '{}{:03d}of{:03d}.tfrecord'.format(args.split, args.fold, args.num_folds))
 
 split_fn = {
     'train': 'tvqa_train.jsonl',
     'val': 'tvqa_val.jsonl',
     'test': 'tvqa_test_public.jsonl',
 }[args.split]
-split_fn = os.path.join(args.data_dir, 'tvqa_qa_release', split_fn)
+split_fn = os.path.join(os.environ["QA_PATH"], split_fn)
 
 data = []
 with open(split_fn, 'r') as f:
@@ -144,7 +79,7 @@ def parse_item(item):
         'House M.D.': 'house',
         'Castle': 'castle',
     }[item['show_name']]
-    frames_path = os.path.join(args.data_dir, 'tvqa_frames', 'frames_hq', f'{show_shortname}_frames',
+    frames_path = os.path.join(os.environ["FRAMES_PATH"], f'{show_shortname}_frames',
                             item['vid_name'])
 
     max_frame_no = max([int(x.split('.')[0]) for x in os.listdir(frames_path)])
@@ -204,7 +139,7 @@ def parse_item(item):
     show_audioname = show_shortname if show_shortname != 'bbt' else 'bbt_new'
 
 
-    audio_fn_mp3 = os.path.join(args.data_dir, 'tvqa_frames', 'audios', show_audioname,
+    audio_fn_mp3 = os.path.join(os.environ["AUDIO_PATH"], show_audioname,
                             f'{show_shortname}_audios', item['vid_name'] + '.mp3')
     # Start the process
     temp_folder = tempfile.TemporaryDirectory()
@@ -255,7 +190,7 @@ def parse_item(item):
     # Get subtitles
     #############################################################
     show_subname = item['vid_name']
-    sub_fn = os.path.join(args.data_dir, 'tvqa_subtitles', show_subname + '.srt')
+    sub_fn = os.path.join(os.environ['SUBTITLES_PATH'], show_subname + '.srt')
     if not os.path.exists(sub_fn):
         import ipdb
         ipdb.set_trace()

@@ -34,6 +34,9 @@ import os
 import optax
 from tqdm import tqdm
 import json
+from dotenv import load_dotenv
+
+load_dotenv('../../.env')
 
 jax.config.update('jax_log_compiles', True)
 is_on_gpu = any([x.platform == 'gpu' for x in jax.local_devices()])
@@ -193,7 +196,7 @@ p_pred_step = jax.pmap(pred_step, axis_name='batch', donate_argnums=(1,))
 
 out = {}
 for split in ['val', 'test']:
-    config['data']['val_fns'] = f"path_to_tvqa/{split}" + '{:03d}of008.tfrecord'
+    config['data']['val_fns'] = os.path.join(os.environ["TVQA_PATH"], split + '{:03d}of008.tfrecord')
     val_iter = finetune_val_input_fn_builder(config, 'tvqa')
 
     for ids, batch in tqdm(val_iter):
