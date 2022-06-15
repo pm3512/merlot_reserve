@@ -196,7 +196,7 @@ p_pred_step = jax.pmap(pred_step, axis_name='batch', donate_argnums=(1,))
 
 out = {}
 for split in ['val', 'test']:
-    config['data']['val_fns'] = os.path.join(os.environ["TVQA_PATH"], split + '{:03d}of008.tfrecord')
+    config['data']['val_fns'] = os.path.join(os.environ["TFRECORDS_PATH"], split + '{:03d}of008.tfrecord')
     val_iter = finetune_val_input_fn_builder(config, 'tvqa')
 
     for ids, batch in tqdm(val_iter):
