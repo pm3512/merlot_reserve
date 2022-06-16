@@ -22,7 +22,7 @@ import regex as re
 from tqdm import tqdm
 import pandas as pd
 from finetune.common_data_utils import *
-from collections import defaultdict
+from collections import Counter, defaultdict
 import colorsys
 import hashlib
 import tempfile
@@ -34,6 +34,7 @@ import pysrt
 from unidecode import unidecode
 import ftfy
 from dotenv import load_dotenv
+import json
 
 load_dotenv('../../.env')
 
@@ -66,6 +67,9 @@ with open(split_fn, 'r') as f:
 ts_lens = [x['ts'][1] - x['ts'][0] for x in data]
 max_end = max([x['ts'][1] for x in data])
 
+with open(os.environ['ST_PATH'], 'r') as f:
+    speaker_turns = json.load(f)
+
 def parse_item(item):
     qa_item = {'qa_query': item.pop('q'), 'qa_choices': [item.pop(f'a{i}') for i in range(5)],
                'qa_label': item.get('answer_idx', 0),
@@ -81,6 +85,9 @@ def parse_item(item):
     }[item['show_name']]
     frames_path = os.path.join(os.environ["FRAMES_PATH"], f'{show_shortname}_frames',
                             item['vid_name'])
+
+    # speaker turns for the clip
+    sts = speaker_turns[item['vid_name']]
 
     max_frame_no = max([int(x.split('.')[0]) for x in os.listdir(frames_path)])
     max_time = (max_frame_no - 1) / 3.0
@@ -117,6 +124,12 @@ def parse_item(item):
                 times_used0.append({'start_time': t0, 'end_time': t1})
     times_used0 = sorted(times_used0, key=lambda x: x['start_time'])
 
+    def dist_to_st(timestamp: float, st):
+        timestamp_ms = timestamp * 1000
+        if st['start'] <= timestamp_ms and timestamp_ms <= st['end']:
+            return 0
+        return min(abs(timestamp_ms - st['start']), abs(timestamp_ms - st['end']))
+
     ###
     frames = []
     times_used = []
@@ -126,12 +139,22 @@ def parse_item(item):
         t_mid_3ps_idx = max(t_mid_3ps_idx, 1)
         t_mid_3ps_idx = min(t_mid_3ps_idx, max_frame_no)
 
+        # find speaker turn closest to the frame
+        closest_st_idx = 0
+        for i, st in enumerate(sts):
+            if dist_to_st(t_midframe, st) < dist_to_st(t_midframe, sts[closest_st_idx]):
+                closest_st_idx = i
+        
+
         fn = os.path.join(frames_path, f'{t_mid_3ps_idx:05d}.jpg')
         if os.path.exists(fn):
             image = Image.open(fn)
             image = resize_image(image, shorter_size_trg=450, longer_size_max=800)
             frames.append(image)
-            times_used.append(trow)
+            times_used.append({
+                **trow,
+                'st': closest_st_idx
+            })
         else:
             print(f"{fn} doesn't exist")
 
@@ -226,12 +249,25 @@ def parse_item(item):
     qa_item['_frames_path'] = frames_path
     qa_item['_time_interval'] = [ts0, ts1]
 
+    # pad each speaker turn to 2
+    counter = Counter([ts_group['st'] for ts_group in times_used])
+    for st, count in counter.items():
+        st_segments = [(i, ts_group) for i, ts_group in enumerate(times_used) if ts_group['st'] == st]
+        last_idx = st_segments[-1][0]
+        for _ in range(2 - count):
+            times_used.append({'start_time': -1, 'end_time': -1, 'sub': '', 'st': st})
+            frames.append(frames[last_idx])
+            spectrograms.append(spectrograms[last_idx])
+        # remove segments which are the furthest from midpoint
+        if count > 2:
+            st_segments = sorted(st_segments, key=lambda seg: abs(midpoint - (seg[1]['start_time'] + seg[1]['end_time']) / 2))
+            drop_idx = [i for i, _ in st_segments[::-1]][:count - 2]
+            drop_idx.sort(reverse=True)
+            for idx in drop_idx:
+                times_used.pop(idx)
+                frames.pop(idx)
+                spectrograms.pop(idx)
 
-    # Pad to 7
-    for i in range(7 - len(frames)):
-        frames.append(frames[-1])
-        spectrograms.append(spectrograms[-1])
-        times_used.append({'start_time': -1, 'end_time': -1, 'sub': ''})
 
     return qa_item, frames, spectrograms, times_used
 
@@ -261,15 +297,25 @@ with GCSTFRecordWriter(out_fn, auto_close=False) as tfrecord_writer:
             feature_dict[f'qa_choice_{i}'] = int64_list_feature(choice_i.ids)
             max_query = max(len(choice_i.ids) + len(query_enc), max_query)
 
+        st_count = {str(sub['st']): 0 for sub in subs}
         for i, (frame_i, spec_i, subs_i) in enumerate(zip(frames, specs, subs)):
-            feature_dict[f'c{i:02d}/image_encoded'] = bytes_feature(pil_image_to_jpgstring(frame_i))
+            speaker_turn = str(subs_i['st'])
+            idx_in_st = st_count[speaker_turn]
+            feature_dict[f'st_{speaker_turn}/c{idx_in_st:02d}/image_encoded'] = bytes_feature(
+                pil_image_to_jpgstring(frame_i)
+            )
 
             compressed = np.minimum(spec_i.reshape(-1, 65) * qa_item['magic_number'], 255.0).astype(np.uint8)
             assert compressed.shape == (180, 65)
-            feature_dict[f'c{i:02d}/spec_encoded'] = bytes_feature(pil_image_to_jpgstring(Image.fromarray(compressed)))
+            feature_dict[f'st_{speaker_turn}/c{idx_in_st:02d}/spec_encoded'] = bytes_feature(
+                pil_image_to_jpgstring(Image.fromarray(compressed))
+            )
 
-            feature_dict[f'c{i:02d}/sub'] = int64_list_feature(encoder.encode(subs_i['sub']).ids)
-            max_query += len(feature_dict[f'c{i:02d}/sub'].int64_list.value)
+            feature_dict[f'st_{speaker_turn}/c{idx_in_st:02d}/sub'] = int64_list_feature(
+                encoder.encode(subs_i['sub']).ids
+            )
+            max_query += len(feature_dict[f'st_{speaker_turn}/c{idx_in_st:02d}/sub'].int64_list.value)
+            st_count[speaker_turn] += 1
         max_len = max(max_len, max_query)
 
         if num_written < 4:
