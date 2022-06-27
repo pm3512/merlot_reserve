@@ -3,6 +3,8 @@ Convert TVQA into tfrecords
 """
 import sys
 
+from pexpect import ExceptionPexpect
+
 sys.path.append('../../')
 import argparse
 import hashlib
@@ -36,6 +38,9 @@ import ftfy
 from dotenv import load_dotenv
 import json
 
+NUM_ST = 7
+SEGMENTS_PER_ST = 7
+
 load_dotenv('../../.env')
 
 parser = create_base_parser()
@@ -52,20 +57,27 @@ split_fn = {
 }[args.split]
 split_fn = os.path.join(os.environ["QA_PATH"], split_fn)
 
-data = []
-with open(split_fn, 'r') as f:
-    for idx, l in enumerate(f):
-        if idx % args.num_folds != args.fold:
-            continue
-        item = json.loads(l)
-        item['ts'] = tuple([float(x) for x in item['ts'].split('-')])
-        assert len(item['ts']) == 2
-        if np.any(np.isnan(item['ts'])):
-            item['ts'] = (0, 9999.0)
-        data.append(item)
 
-ts_lens = [x['ts'][1] - x['ts'][0] for x in data]
-max_end = max([x['ts'][1] for x in data])
+
+data = []
+if split_fn.startswith('gs://'):
+    gclient = storage.Client()
+    bucket_name, file_name = split_fn.split('gs://', 1)[1].split('/', 1)
+    bucket = gclient.get_bucket(bucket_name)
+    blob = bucket.get_blob(file_name)
+    text = blob.download_as_text(encoding='utf-8').splitlines()
+else:
+    with open(split_fn, 'r') as f:
+        text = f.readlines()
+for idx, l in enumerate(text):
+    if idx % args.num_folds != args.fold:
+        continue
+    item = json.loads(l)
+    item['ts'] = tuple([float(x) for x in item['ts'].split('-')])
+    assert len(item['ts']) == 2
+    if np.any(np.isnan(item['ts'])):
+        item['ts'] = (0, 9999.0)
+    data.append(item)
 
 with open(os.environ['ST_PATH'], 'r') as f:
     speaker_turns = json.load(f)
@@ -85,11 +97,17 @@ def parse_item(item):
     }[item['show_name']]
     frames_path = os.path.join(os.environ["FRAMES_PATH"], f'{show_shortname}_frames',
                             item['vid_name'])
-
+    if frames_path.startswith('gs://'):
+        client = storage.Client()
+        bucket_name, dir_name = frames_path.split('gs://', 1)[1].split('/', 1)
+        max_frame_no = max([int(x.name.split('/')[-1].split('.')[0]) for x in client.list_blobs(bucket_name, prefix=dir_name)])
+    else:
+        max_frame_no = max([int(x.split('.')[0]) for x in os.listdir(frames_path)])
+        
+        
     # speaker turns for the clip
     sts = speaker_turns[item['vid_name']]
 
-    max_frame_no = max([int(x.split('.')[0]) for x in os.listdir(frames_path)])
     max_time = (max_frame_no - 1) / 3.0
 
     ts0, ts1 = item.pop('ts')
@@ -118,7 +136,7 @@ def parse_item(item):
 
             if t1 < 0:
                 continue
-            if t0 > max_time:
+            if t0 > max_time: 
                 continue
             if len(times_used0) < 7:
                 times_used0.append({'start_time': t0, 'end_time': t1})
@@ -147,16 +165,29 @@ def parse_item(item):
         
 
         fn = os.path.join(frames_path, f'{t_mid_3ps_idx:05d}.jpg')
-        if os.path.exists(fn):
-            image = Image.open(fn)
+        image_exists = True
+        if fn.startswith('gs://'):
+            client = storage.Client()
+            bucket_name, file_name = fn.split('gs://', 1)[1].split('/', 1)
+            bucket = client.bucket(bucket_name)
+            if storage.Blob(bucket=bucket, name=file_name).exists(client):
+                image = Image.open(io.BytesIO(bucket.get_blob(file_name).download_as_string()))
+            else:
+                image_exists = False
+        else:
+            if os.path.exists(fn):
+                image = Image.open(fn)
+            else:
+                image_exists = False
+        if not image_exists:
+            print(f"{fn} doesn't exist")
+        else:
             image = resize_image(image, shorter_size_trg=450, longer_size_max=800)
             frames.append(image)
             times_used.append({
                 **trow,
                 'st': closest_st_idx
             })
-        else:
-            print(f"{fn} doesn't exist")
 
     ### idk why this is the case...
     show_audioname = show_shortname if show_shortname != 'bbt' else 'bbt_new'
@@ -249,17 +280,22 @@ def parse_item(item):
     qa_item['_frames_path'] = frames_path
     qa_item['_time_interval'] = [ts0, ts1]
 
-    # pad each speaker turn to 2
+    st_idx = sorted(set([ts['st'] for ts in times_used]))
+    st_idx_convert = {st: idx for idx, st in enumerate(st_idx)}
+    for ts in times_used:
+        ts['st'] = st_idx_convert[ts['st']]
+
+    # pad each speaker turn to SEGMENTS_PER_ST 
     counter = Counter([ts_group['st'] for ts_group in times_used])
     for st, count in counter.items():
         st_segments = [(i, ts_group) for i, ts_group in enumerate(times_used) if ts_group['st'] == st]
         last_idx = st_segments[-1][0]
-        for _ in range(2 - count):
+        for _ in range(SEGMENTS_PER_ST - count):
             times_used.append({'start_time': -1, 'end_time': -1, 'sub': '', 'st': st})
-            frames.append(frames[last_idx])
-            spectrograms.append(spectrograms[last_idx])
+            frames.append(Image.fromarray(np.zeros_like(frames[last_idx])))
+            spectrograms.append(np.zeros_like(spectrograms[last_idx]))
         # remove segments which are the furthest from midpoint
-        if count > 2:
+        if count > SEGMENTS_PER_ST:
             st_segments = sorted(st_segments, key=lambda seg: abs(midpoint - (seg[1]['start_time'] + seg[1]['end_time']) / 2))
             drop_idx = [i for i, _ in st_segments[::-1]][:count - 2]
             drop_idx.sort(reverse=True)
@@ -267,6 +303,13 @@ def parse_item(item):
                 times_used.pop(idx)
                 frames.pop(idx)
                 spectrograms.pop(idx)
+
+    # add empty speaker turns
+    for st in range(NUM_ST - len(counter)):
+        for _ in range(SEGMENTS_PER_ST):
+            times_used.append({'start_time': -1, 'end_time': -1, 'sub': '', 'st': len(counter) + st })
+            frames.append(Image.fromarray(np.zeros_like(frames[-1])))
+            spectrograms.append(np.zeros_like(spectrograms[-1]))
 
 
     return qa_item, frames, spectrograms, times_used
@@ -316,6 +359,7 @@ with GCSTFRecordWriter(out_fn, auto_close=False) as tfrecord_writer:
             )
             max_query += len(feature_dict[f'st_{speaker_turn}/c{idx_in_st:02d}/sub'].int64_list.value)
             st_count[speaker_turn] += 1
+            assert st_count[speaker_turn] <= SEGMENTS_PER_ST
         max_len = max(max_len, max_query)
 
         if num_written < 4:
