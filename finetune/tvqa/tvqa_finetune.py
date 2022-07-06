@@ -110,7 +110,8 @@ config['data']['num_train_files'] = 256
 config['data']['num_answers'] = 5
 config['data']['random_scale_max'] = 1.1
 config['data']['random_scale_min'] = 1.0
-config['data']['num_segments'] = 7
+config['data']['num_speaker_turns'] = 7
+config['data']['segments_per_st'] = 7
 
 config['device']['batch_size'] = 8
 config['device']['prefetch_size'] = 0

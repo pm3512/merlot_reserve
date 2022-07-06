@@ -154,10 +154,11 @@ def preprocess_tvqa(record, config):
     for i in range(config['num_answers']):
         k2f[f'qa_choice_{i}'] = tf.io.VarLenFeature(tf.int64)
 
-    for i in range(config['num_segments']):
-        k2f[f'c{i:02d}/image_encoded'] = tf.io.FixedLenFeature((), tf.string, default_value='')
-        k2f[f'c{i:02d}/spec_encoded'] = tf.io.FixedLenFeature((), tf.string, default_value='')
-        k2f[f'c{i:02d}/sub'] = tf.io.VarLenFeature(tf.int64)
+    for i in range(config['num_speaker_turns']):
+        for j in range(config['segments_per_st']):
+            k2f[f'st_{i}/c{j:02d}/image_encoded'] = tf.io.FixedLenFeature((), tf.string, default_value='')
+            k2f[f'st_{i}/c{j:02d}/spec_encoded'] = tf.io.FixedLenFeature((), tf.string, default_value='')
+            k2f[f'st_{i}/c{j:02d}/sub'] = tf.io.VarLenFeature(tf.int64)
     features = tf.io.parse_single_example(record, k2f)
     def _unsparsify(x):
         if isinstance(x, tf.SparseTensor):
@@ -165,83 +166,92 @@ def preprocess_tvqa(record, config):
         if x.dtype == tf.int64:
             x = tf.cast(x, dtype=tf.int32)
         return x
-
-    segment_list = [{k: _unsparsify(features.pop(f'c{i:02d}/{k}')) for k in ['image_encoded', 'spec_encoded', 'sub']} for i in
-                    range(config['num_segments'])]
+    
+    segment_list = [[{k: _unsparsify(features.pop(f'st_{i}/c{j:02d}/{k}')) for k in ['image_encoded', 'spec_encoded', 'sub']} for j in
+                    range(config['segments_per_st'])] for i in range(config['num_speaker_turns'])]
     features = {k: _unsparsify(v) for k, v in features.items()}
 
+    for st_num in range(config['num_speaker_turns']):
+        st = str(st_num)
+        features[st] = {}
+        encodeds = tf.stack([x['image_encoded'] for x in segment_list[st_num]])
+        features[st]['images'] = tf.map_fn(functools.partial(load_and_resize_img, config=config),
+                                    elems=encodeds, fn_output_signature=tf.float32, name='decode_img')
 
-    encodeds = tf.stack([x['image_encoded'] for x in segment_list])
-    features['images'] = tf.map_fn(functools.partial(load_and_resize_img, config=config),
-                                   elems=encodeds, fn_output_signature=tf.float32, name='decode_img')
-
-    audio_encodeds = tf.stack([x['spec_encoded'] for x in segment_list])
-    features['audio_clips'] = tf.map_fn(functools.partial(tf.image.decode_jpeg, channels=1), audio_encodeds, fn_output_signature=tf.uint8)
-    features['audio_clips'] = tf.reshape(features['audio_clips'], [config['num_segments'], 3, 60, 65])
-    features['audio_clips'] = tf.cast(features['audio_clips'], dtype=tf.float32) / features['magic_number']
+        audio_encodeds = tf.stack([x['spec_encoded'] for x in segment_list[st_num]])
+        features[st]['audio_clips'] = tf.map_fn(functools.partial(tf.image.decode_jpeg, channels=1), audio_encodeds, fn_output_signature=tf.uint8)
+        features[st]['audio_clips'] = tf.reshape(features[st]['audio_clips'], [config['num_speaker_turns'], 3, 60, 65])
+        features[st]['audio_clips'] = tf.cast(features[st]['audio_clips'], dtype=tf.float32) / features['magic_number']
 
     #############
     query = tf.concat([features.pop('qa_query'), encoder.encode('answer: ').ids], 0)
 
-    textonly_seqs = []
-    audio_seqs = []
 
+    option = [None for _ in range(config['num_answers'])]
     for i in range(config['num_answers']):
-        option_i = tf.concat([query, features.pop(f'qa_choice_{i}')], 0)
-        option_i = tf.concat([option_i[:(config['lang_seq_len'] - 1)], [MASK]], 0)
+        option[i] = tf.concat([query, features.pop(f'qa_choice_{i}')], 0)
+        option[i] = tf.concat([option[i][:(config['lang_seq_len'] - 1)], [MASK]], 0)
 
-        # Now we add the subtitles
-        sub_input_ragged = tf.ragged.stack([option_i] + [x['sub'] for x in segment_list])
-        segment_id = tf.cast(tf.where(sub_input_ragged)[:, 0], dtype=tf.int32)
-        textonly_seq_i = tf.stack([sub_input_ragged.values, segment_id], -1)
-        textonly_seq_i = pad_to_fixed_size(textonly_seq_i, 0,
-                                           output_shape=[config['lang_seq_len'], 2], truncate=True)
-        textonly_seqs.append(textonly_seq_i)
+    label = features.pop('qa_label')
 
-        # Now we add the non-subtitles
-        audio_span_full = tf.fill([3 * config['audio_token_length']], AUDIOSPAN)
-        audio_input_ragged = tf.ragged.stack([option_i] + [audio_span_full for _ in segment_list])
-        segment_id = tf.cast(tf.where(audio_input_ragged)[:, 0], dtype=tf.int32)
-        audio_seq_i = tf.stack([audio_input_ragged.values, segment_id], -1)
-        audio_seq_i = pad_to_fixed_size(audio_seq_i, 0,
-                                                   output_shape=[config['lang_seq_len'], 2], truncate=True)
-        audio_seqs.append(audio_seq_i)
+    for st_num in range(config['num_speaker_turns']):
+        st = str(st_num)
+        textonly_seqs = []
+        audio_seqs = []
 
-    features['textonly_seqs'] = tf.stack(textonly_seqs)
-    features['audio_seqs'] = tf.stack(audio_seqs)
-    features['labels'] = features.pop('qa_label')
+        for i in range(config['num_answers']):
+            # Now we add the subtitles
+            sub_input_ragged = tf.ragged.stack([option[i]] + [x['sub'] for x in segment_list[st_num]])
+            segment_id = tf.cast(tf.where(sub_input_ragged)[:, 0], dtype=tf.int32)
+            textonly_seq_i = tf.stack([sub_input_ragged.values, segment_id], -1)
+            textonly_seq_i = pad_to_fixed_size(textonly_seq_i, 0,
+                                            output_shape=[config['lang_seq_len'], 2], truncate=True)
+            textonly_seqs.append(textonly_seq_i)
 
-    # do this so we don't have to mask
-    frame_is_valid = tf.cast(tf.less(tf.range(config['num_segments']), features['num_frames']), dtype=tf.float32)
-    features['images'] *= frame_is_valid[:, None, None]
+            # Now we add the non-subtitles
+            audio_span_full = tf.fill([3 * config['audio_token_length']], AUDIOSPAN)
+            audio_input_ragged = tf.ragged.stack([option[i]] + [audio_span_full for _ in segment_list[st_num]])
+            segment_id = tf.cast(tf.where(audio_input_ragged)[:, 0], dtype=tf.int32)
+            audio_seq_i = tf.stack([audio_input_ragged.values, segment_id], -1)
+            audio_seq_i = pad_to_fixed_size(audio_seq_i, 0,
+                                                    output_shape=[config['lang_seq_len'], 2], truncate=True)
+            audio_seqs.append(audio_seq_i)
 
-    if config.get('do_random_scale', True):
-        print("Random adjustment of audio clips")
-        old_shape = get_shape_list(features['audio_clips'], 4)
-        old_nwindow = old_shape[0] * old_shape[1] * old_shape[2]
-        num_mels = old_shape[3]
+        features[st]['textonly_seqs'] = tf.stack(textonly_seqs)
+        features[st]['audio_seqs'] = tf.stack(audio_seqs)
+        features[st]['labels'] = label
 
-        features['audio_clips'] = features['audio_clips'][:features['num_frames']]
-        giant_seq = tf.reshape(features['audio_clips'], [-1, num_mels])
-        avg = tf.reduce_mean(giant_seq, 0)
-        std = tf.math.reduce_std(giant_seq, 0)
+        # do this so we don't have to mask
+        frame_is_valid = tf.cast(tf.less(tf.range(config['segments_per_st']), features['num_frames']), dtype=tf.float32)
+        features[st]['images'] *= frame_is_valid[:, None, None]
 
-        amt_to_pad_start = 4
-        start = tf.random.normal([amt_to_pad_start, num_mels], mean=avg, stddev=std)
+        if config.get('do_random_scale', True):
+            print("Random adjustment of audio clips")
+            old_shape = get_shape_list(features[st]['audio_clips'], 4)
+            old_nwindow = old_shape[0] * old_shape[1] * old_shape[2]
+            num_mels = old_shape[3]
 
-        amt_to_pad_end = 4 + (old_nwindow - get_shape_list(giant_seq, 2)[0])
-        end = tf.random.normal([amt_to_pad_end, num_mels], mean=avg, stddev=std)
+            features[st]['audio_clips'] = features[st]['audio_clips'][:features['num_frames']]
+            giant_seq = tf.reshape(features[st]['audio_clips'], [-1, num_mels])
+            avg = tf.reduce_mean(giant_seq, 0)
+            std = tf.math.reduce_std(giant_seq, 0)
 
-        seq = tf.concat([start, giant_seq, end], 0)
-        start_idx = tf.random.uniform([], minval=0, maxval=amt_to_pad_start + 1, dtype=tf.int32)
-        seq = seq[start_idx:(start_idx+old_nwindow)]
-        features['audio_clips'] = tf.reshape(seq, old_shape)
-    features['audio_clips'] *= frame_is_valid[:, None, None, None]
+            amt_to_pad_start = 4
+            start = tf.random.normal([amt_to_pad_start, num_mels], mean=avg, stddev=std)
 
-    # final thing should always be 1 and it's being rounded right now
-    features['audio_clips'] = tf.concat([features['audio_clips'][..., :-1],
-                                              tf.ones_like(features['audio_clips'][..., 0, None])
-                                              ], -1)
+            amt_to_pad_end = 4 + (old_nwindow - get_shape_list(giant_seq, 2)[0])
+            end = tf.random.normal([amt_to_pad_end, num_mels], mean=avg, stddev=std)
+
+            seq = tf.concat([start, giant_seq, end], 0)
+            start_idx = tf.random.uniform([], minval=0, maxval=amt_to_pad_start + 1, dtype=tf.int32)
+            seq = seq[start_idx:(start_idx+old_nwindow)]
+            features[st]['audio_clips'] = tf.reshape(seq, old_shape)
+        features[st]['audio_clips'] *= frame_is_valid[:, None, None, None]
+
+        # final thing should always be 1 and it's being rounded right now
+        features[st]['audio_clips'] = tf.concat([features[st]['audio_clips'][..., :-1],
+                                                tf.ones_like(features[st]['audio_clips'][..., 0, None])
+                                                ], -1)
     return features
 
 
@@ -277,15 +287,26 @@ def make_dataset_singleimg(config, fns, preprocessor, batch_size, num_devices=1,
     dataset = dataset.map(functools.partial(preprocessor, config=merged_config),
                           num_parallel_calls=tf.data.experimental.AUTOTUNE)
     dataset = dataset.batch(batch_size=batch_size, drop_remainder=is_training)
+
     def _handle_batch(batched_tensor):
         for k in batched_tensor.keys():
-            batched_tensor[k] = tf.reshape(batched_tensor[k],
-                                           [num_devices, batch_size // num_devices] +
-                                           get_shape_list(batched_tensor[k])[1:])
-            if (merged_config['use_bfloat16']) and batched_tensor[k].dtype == tf.float32:
-                batched_tensor[k] = tf.cast(batched_tensor[k], dtype=tf.bfloat16)
+            if isinstance(batched_tensor[k], dict):
+                for j in batched_tensor[k].keys():
+                    batched_tensor[k][j] = tf.reshape(batched_tensor[k][j],
+                                                [num_devices, batch_size // num_devices] +
+                                                get_shape_list(batched_tensor[k][j])[1:])
+                    if (merged_config['use_bfloat16']) and batched_tensor[k][j].dtype == tf.float32:
+                        batched_tensor[k][j] = tf.cast(batched_tensor[k][j], dtype=tf.bfloat16)
+            else:
+                batched_tensor[k] = tf.reshape(batched_tensor[k],
+                                            [num_devices, batch_size // num_devices] +
+                                            get_shape_list(batched_tensor[k])[1:])
+                if (merged_config['use_bfloat16']) and batched_tensor[k].dtype == tf.float32:
+                    batched_tensor[k] = tf.cast(batched_tensor[k], dtype=tf.bfloat16)
+
         return batched_tensor
     dataset = dataset.map(_handle_batch)
+    print('after handling batch')
     return dataset
 
 def finetune_input_fn_builder(config, preprocessor_type):
