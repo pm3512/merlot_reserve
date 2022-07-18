@@ -74,7 +74,8 @@ def construct_finetuning_train_state(opt_config, model, params, only_state=False
     :return:
     """
     def mask_fn(p):
-        return jax.tree_map(lambda x: (x.ndim > 1) and (x.size > 4096), p)
+        # x.shape == (576, 1) is a workaround to include the final dense layer
+        return jax.tree_map(lambda x: (x.ndim > 1) and (x.size > 4096 or x.shape == (576, 1)), p)
 
     tx_fns = [
         scale_by_bfloat16_adam(b1=opt_config.get('beta_1', 0.9),
@@ -127,7 +128,13 @@ def finetune_train_step(state: train_state.TrainState, batch,
         # note this technically adds the gradients, but that's probably OK since adam will scale everything back right?
         def _microbatch(old_grads, microbatch):
             def _loss_fn(params):
-                return loss_fn(state, params, {k: v[None] for k, v in microbatch.items()})
+                microbatch_features = {}
+                for k, v in microbatch.items():
+                    if isinstance(v, dict):
+                        microbatch_features[k] = {k2: v2[None] for k2, v2 in v.items()}
+                    else:
+                        microbatch_features[k] = v[None]
+                return loss_fn(state, params, microbatch_features)
             grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
             (loss, loss_info), grads = grad_fn(params)
             grads = jax.tree_multimap(lambda a, b: a + b, old_grads, grads)

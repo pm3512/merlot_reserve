@@ -171,6 +171,7 @@ def preprocess_tvqa(record, config):
                     range(config['segments_per_st'])] for i in range(config['num_speaker_turns'])]
     features = {k: _unsparsify(v) for k, v in features.items()}
 
+    mask = [None for _ in range(config['segments_per_st'])]
     for st_num in range(config['num_speaker_turns']):
         st = str(st_num)
         features[st] = {}
@@ -178,10 +179,18 @@ def preprocess_tvqa(record, config):
         features[st]['images'] = tf.map_fn(functools.partial(load_and_resize_img, config=config),
                                     elems=encodeds, fn_output_signature=tf.float32, name='decode_img')
 
+        images_nonempty = tf.clip_by_value(tf.math.count_nonzero(features[st]['images'], [1, 2]), 0, 1)
+
         audio_encodeds = tf.stack([x['spec_encoded'] for x in segment_list[st_num]])
         features[st]['audio_clips'] = tf.map_fn(functools.partial(tf.image.decode_jpeg, channels=1), audio_encodeds, fn_output_signature=tf.uint8)
         features[st]['audio_clips'] = tf.reshape(features[st]['audio_clips'], [config['num_speaker_turns'], 3, 60, 65])
         features[st]['audio_clips'] = tf.cast(features[st]['audio_clips'], dtype=tf.float32) / features['magic_number']
+
+        audio_nonempty = tf.clip_by_value(tf.math.count_nonzero(features[st]['audio_clips'], [1, 2, 3]), 0, 1)
+        mask[st_num] = tf.clip_by_value(images_nonempty + audio_nonempty, 0, 1)
+        mask[st_num] = tf.cast(mask[st_num], tf.int32)
+
+    mask_whole = [tf.clip_by_value(tf.math.reduce_sum(t), 0, 1) for t in mask]
 
     #############
     query = tf.concat([features.pop('qa_query'), encoder.encode('answer: ').ids], 0)
@@ -193,6 +202,7 @@ def preprocess_tvqa(record, config):
         option[i] = tf.concat([option[i][:(config['lang_seq_len'] - 1)], [MASK]], 0)
 
     label = features.pop('qa_label')
+    features['labels'] = label
 
     for st_num in range(config['num_speaker_turns']):
         st = str(st_num)
@@ -206,6 +216,11 @@ def preprocess_tvqa(record, config):
             textonly_seq_i = tf.stack([sub_input_ragged.values, segment_id], -1)
             textonly_seq_i = pad_to_fixed_size(textonly_seq_i, 0,
                                             output_shape=[config['lang_seq_len'], 2], truncate=True)
+
+            mask_shape = get_shape_list(textonly_seq_i, 2) 
+            textonly_mask = tf.repeat(mask_whole[st_num], mask_shape[0] * mask_shape[1])
+            textonly_mask = tf.reshape(textonly_mask, mask_shape)
+            textonly_seq_i = textonly_seq_i * textonly_mask
             textonly_seqs.append(textonly_seq_i)
 
             # Now we add the non-subtitles
@@ -215,11 +230,15 @@ def preprocess_tvqa(record, config):
             audio_seq_i = tf.stack([audio_input_ragged.values, segment_id], -1)
             audio_seq_i = pad_to_fixed_size(audio_seq_i, 0,
                                                     output_shape=[config['lang_seq_len'], 2], truncate=True)
+
+            mask_shape = get_shape_list(audio_seq_i, 2) 
+            audio_mask = tf.repeat(mask_whole[st_num], mask_shape[0] * mask_shape[1])
+            audio_mask = tf.reshape(audio_mask, mask_shape)
+            audio_seq_i = audio_seq_i * audio_mask
             audio_seqs.append(audio_seq_i)
 
         features[st]['textonly_seqs'] = tf.stack(textonly_seqs)
         features[st]['audio_seqs'] = tf.stack(audio_seqs)
-        features[st]['labels'] = label
 
         # do this so we don't have to mask
         frame_is_valid = tf.cast(tf.less(tf.range(config['segments_per_st']), features['num_frames']), dtype=tf.float32)
@@ -249,9 +268,12 @@ def preprocess_tvqa(record, config):
         features[st]['audio_clips'] *= frame_is_valid[:, None, None, None]
 
         # final thing should always be 1 and it's being rounded right now
+        mask_shape = get_shape_list(features[st]['audio_clips'], 4)
+        audio_clips_mask = tf.map_fn(lambda x: tf.fill(mask_shape[1:], x), mask[st_num])
         features[st]['audio_clips'] = tf.concat([features[st]['audio_clips'][..., :-1],
                                                 tf.ones_like(features[st]['audio_clips'][..., 0, None])
                                                 ], -1)
+        features[st]['audio_clips'] = features[st]['audio_clips'] * tf.cast(audio_clips_mask, tf.float32)
     return features
 
 
@@ -306,7 +328,6 @@ def make_dataset_singleimg(config, fns, preprocessor, batch_size, num_devices=1,
 
         return batched_tensor
     dataset = dataset.map(_handle_batch)
-    print('after handling batch')
     return dataset
 
 def finetune_input_fn_builder(config, preprocessor_type):
@@ -359,8 +380,13 @@ def finetune_val_input_fn_builder(config, preprocessor_type):
     dataset = dataset.batch(batch_size=batch_size, drop_remainder=False)
     def _bfloat16_cast(batched_tensor):
         for k in batched_tensor.keys():
-            if (merged_config['use_bfloat16']) and batched_tensor[k].dtype == tf.float32:
-                batched_tensor[k] = tf.cast(batched_tensor[k], dtype=tf.bfloat16)
+            if isinstance(batched_tensor[k], dict):
+                for k2 in batched_tensor[k]:
+                    if (merged_config['use_bfloat16']) and batched_tensor[k][k2].dtype == tf.float32:
+                        batched_tensor[k][k2] = tf.cast(batched_tensor[k][k2], dtype=tf.bfloat16)
+            else:
+                if (merged_config['use_bfloat16']) and batched_tensor[k].dtype == tf.float32:
+                    batched_tensor[k] = tf.cast(batched_tensor[k], dtype=tf.bfloat16)
         return batched_tensor
     dataset = dataset.map(_bfloat16_cast)
 
@@ -376,9 +402,16 @@ def finetune_val_input_fn_builder(config, preprocessor_type):
                 ids.append('pad')
 
         for k in item.keys():
-            if pad_val > 0:
-                pad_shape = [pad_val] + list(item[k].shape[1:])
-                item[k] = np.concatenate([item[k], np.zeros(pad_shape, item[k].dtype)], 0)
-            item[k] = item[k].reshape([num_devices, batch_size // num_devices] + list(item[k].shape[1:]))
+            if isinstance(item[k], dict):
+                for k2 in item[k]:
+                    if pad_val > 0:
+                        pad_shape = [pad_val] + list(item[k][k2].shape[1:])
+                        item[k][k2] = np.concatenate([item[k][k2], np.zeros(pad_shape, item[k][k2].dtype)], 0)
+                    item[k][k2] = item[k][k2].reshape([num_devices, batch_size // num_devices] + list(item[k][k2].shape[1:]))
+            else:
+                if pad_val > 0:
+                    pad_shape = [pad_val] + list(item[k].shape[1:])
+                    item[k] = np.concatenate([item[k], np.zeros(pad_shape, item[k].dtype)], 0)
+                item[k] = item[k].reshape([num_devices, batch_size // num_devices] + list(item[k].shape[1:]))
 
         yield ids, item

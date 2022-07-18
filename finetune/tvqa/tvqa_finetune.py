@@ -113,7 +113,7 @@ config['data']['random_scale_min'] = 1.0
 config['data']['num_speaker_turns'] = 7
 config['data']['segments_per_st'] = 7
 
-config['device']['batch_size'] = 8
+config['device']['batch_size'] = 32
 config['device']['prefetch_size'] = 0
 config['device']['n_fns_per_cycle'] = 256
 
@@ -165,6 +165,12 @@ class MerlotReserveTVQA(MerlotReserve):
                              use_bias=False)
 
     def __call__(self, batch):
+
+        for k in ['images', 'audio_clips']:
+            batch[k] = batch['0'][k]
+
+        for k in ['audio_seqs', 'textonly_seqs']:
+            batch[k] = batch['0'][k]
 
         # Encode images (twice)
         batch_size, images_per_batch, seq_size, img_dim = batch['images'].shape
@@ -261,6 +267,140 @@ class MerlotReserveTVQA(MerlotReserve):
 
         return logits_from_audio, logits_from_text
 
+class MerlotReserveTVQAFactorized(MerlotReserve):
+    def setup(self) -> None:
+        super().setup()
+        self.proj = nn.Dense(features=1, dtype=self.dtype, kernel_init=jax.nn.initializers.normal(stddev=0.02), name='proj',
+                             use_bias=False)
+
+    def __call__(self, batch):
+        #num_st = len(list(filter(str.isnumeric, batch.keys())))
+        num_st = 6
+
+        for k in ['images', 'audio_clips']:
+            batch[k] = jnp.vstack([batch[str(i)][k] for i in range(num_st)])
+            batch[k] = batch[k][:, :2, ...]
+            old_shape = batch[k].shape
+            batch[k] = jnp.split(batch[k], num_st)
+            batch[k] = jnp.concatenate(batch[k], axis=1)
+            batch[k] = batch[k].reshape(old_shape)
+
+        for k in ['audio_seqs', 'textonly_seqs']:
+            batch[k] = jnp.vstack([batch[str(i)][k] for i in range(num_st)])
+            old_shape = batch[k].shape
+            batch[k] = jnp.split(batch[k], num_st)
+            batch[k] = jnp.concatenate(batch[k], axis=1)
+            batch[k] = batch[k].reshape(old_shape)
+
+        # Encode images (twice)
+
+        batch_size, images_per_batch, seq_size, img_dim = batch['images'].shape
+        imgs_enc = self.vision_encoder(batch['images'].reshape(batch_size * images_per_batch, seq_size, img_dim))['seq_attnpool']
+        imgs_enc = imgs_enc.reshape(batch_size, images_per_batch, seq_size // 4, self.hidden_size)
+
+
+        # Add the "first image"
+        imgs_enc = jnp.concatenate([
+            jnp.zeros([batch_size, 1, seq_size // 4, self.hidden_size], dtype=imgs_enc.dtype),
+            imgs_enc,
+        ], 1)
+
+        # duplicate so that we have one per answer
+        images_per_batch += 1
+        batch_size, num_ans_per, joint_seq_len, two_ = batch['textonly_seqs'].shape
+        
+        imgs_enc = imgs_enc.reshape(batch_size, images_per_batch * seq_size // 4, self.hidden_size).repeat(num_ans_per, axis=0)
+
+        #########################
+        text_toks = batch['textonly_seqs'][..., 0].reshape(batch_size * num_ans_per, joint_seq_len)
+        textonly_inputs = self.prepare_multimodal_inputs(
+            tokens=text_toks,
+            token_segment_idx=batch['textonly_seqs'][..., 1].reshape(batch_size * num_ans_per, joint_seq_len),
+            vision_input=imgs_enc,
+        )
+
+        # Encode audio
+        # Audio clips are provided as [batch_size, num_segments, num_audio_subsegments, audio_seq_len, num_mels]
+        batch_size, num_segments, num_audio_subsegments, audio_seq_len, num_mels = batch['audio_clips'].shape
+        audio_enc = self.audio_encoder(batch['audio_clips'].reshape(-1, audio_seq_len, num_mels))['seq_attnpool']
+
+        _, audio_token_len, hidden_size = audio_enc.shape
+        num_audio_spans = num_segments * num_audio_subsegments
+
+        audio_enc = audio_enc.reshape(batch_size, num_audio_spans, audio_token_len, hidden_size)
+        audio_enc = audio_enc.repeat(num_ans_per, axis=0)
+
+        audio_toks = batch['audio_seqs'][..., 0].reshape(batch_size * num_ans_per, joint_seq_len)
+        audio_pointers = (jnp.cumsum((audio_toks == AUDIOSPAN).astype(jnp.int32), -1) - 1) // audio_token_len
+        audio_pointers = audio_pointers % num_audio_spans
+
+        audio_inputs = self.prepare_multimodal_inputs(
+            tokens=batch['audio_seqs'][..., 0].reshape(batch_size * num_ans_per, joint_seq_len),
+            token_segment_idx=batch['audio_seqs'][..., 1].reshape(batch_size * num_ans_per, joint_seq_len),
+            vision_input=imgs_enc,
+            audio_spans=audio_enc,
+            audio_pointers=audio_pointers,
+        )
+        # hack: remove 'first img' from sequence lengths
+        start_imgs = joint_seq_len + seq_size // 4
+        for k in ['x', 'rotary_coords', 'attention_mask']:
+            textonly_inputs[k] = jnp.concatenate([textonly_inputs[k][:, :joint_seq_len],
+                                                  textonly_inputs[k][:, start_imgs:]], 1)
+
+            audio_inputs[k] = jnp.concatenate([audio_inputs[k][:, :joint_seq_len],
+                                               audio_inputs[k][:, start_imgs:]], 1)
+
+        textonly_inputs['attention_mask'] = jnp.concatenate([textonly_inputs['attention_mask'][:, :, :joint_seq_len],
+                                                             textonly_inputs['attention_mask'][:, :, start_imgs:]], 2)
+
+        audio_inputs['attention_mask'] = jnp.concatenate([audio_inputs['attention_mask'][:, :, :joint_seq_len],
+                                                          audio_inputs['attention_mask'][:, :, start_imgs:]], 2)
+        #############################################################################################################
+
+        # if args.disable_audio:
+        #     x = textonly_inputs['x']
+        #     coords = textonly_inputs['rotary_coords']
+        #     attnmask = textonly_inputs['attention_mask']
+        #     joint_enc = self.joint_transformer(x, rotary_coords=coords, attention_mask=attnmask)['seq']
+        #     joint_enc = joint_enc[:, :joint_seq_len].reshape(batch_size * num_ans_per, joint_seq_len, self.hidden_size)
+        #
+        #     pool_idx = jnp.argmax((text_toks == MASK).astype(jnp.float32), 1)
+        #     pooled_h = joint_enc[jnp.arange(batch_size * num_ans_per), pool_idx]
+        #     logits_from_text = jnp.squeeze(self.proj(pooled_h), -1)
+        #     logits_from_text = logits_from_text.reshape(batch_size, num_ans_per)
+        #     logits_from_audio = jnp.ones_like(logits_from_text)
+        #     return logits_from_audio, logits_from_text
+
+
+        x = jnp.concatenate([audio_inputs['x'], textonly_inputs['x']], 0)
+        coords = jnp.concatenate([audio_inputs['rotary_coords'], textonly_inputs['rotary_coords']], 0)
+        attnmask = jnp.concatenate([audio_inputs['attention_mask'], textonly_inputs['attention_mask']], 0)
+
+        joint_enc = self.joint_transformer(x, rotary_coords=coords, attention_mask=attnmask)['seq']
+        joint_enc = joint_enc[:, :joint_seq_len].reshape(batch_size * 2 * num_ans_per, joint_seq_len, self.hidden_size)
+
+        # Pool from the right tokens
+        pool_idx = jnp.argmax((jnp.concatenate([audio_toks, text_toks], 0) == MASK).astype(jnp.float32), 1)
+        pooled_h = joint_enc[jnp.arange(batch_size * 2 * num_ans_per), pool_idx]
+        audio_h, text_h = jnp.split(pooled_h, 2, axis=0)
+
+        batch_size //= num_st
+        order = [None for _ in range(batch_size * num_ans_per * num_st)]
+        for i in range(batch_size * num_ans_per * num_st):
+            order[i] = (i - i % (num_ans_per * num_st)) + num_ans_per * (i % num_st) + (i % (num_ans_per * num_st) // num_st)
+
+        audio_h = audio_h[order, ...]
+        text_h = text_h[order, ...]
+        pooled_h = jnp.concatenate([audio_h, text_h], axis=0)
+        #pooled_h = jnp.concatenate([pooled_h[:num_ans_per * batch_size, ...], jnp.zeros_like(pooled_h[:num_ans_per * batch_size, ...])])
+        pooled_h = pooled_h.reshape(2 * num_ans_per * batch_size, num_st * pooled_h.shape[1])
+        joint_enc = jnp.squeeze(self.proj(pooled_h), -1)
+
+        logits_from_audio, logits_from_text = jnp.split(joint_enc, 2, axis=0)
+        logits_from_audio = logits_from_audio.reshape(batch_size, num_ans_per)
+        logits_from_text = logits_from_text.reshape(batch_size, num_ans_per)
+
+        return logits_from_audio, logits_from_text
 
 model = MerlotReserveTVQA.from_config(config)
 
@@ -272,7 +412,7 @@ params = load_checkpoint(args.ckpt)['params']
 # Don't need those
 for k in ['head', 'span_encoder']:
     params.pop(k, None)
-hsz = params['joint_transformer']['final_ln']['bias'].shape[0]
+hsz = params['joint_transformer']['final_ln']['bias'].shape[0] #* config['data']['num_speaker_turns']
 params['proj'] = {'kernel': np.random.randn(hsz, 1).astype(np.float32) * 0.01}
 params = freeze(params)
 
@@ -367,7 +507,8 @@ def val_epoch(state: train_state.TrainState):
 train_metrics = []
 log_every = config['device'].get('commit_every_nsteps', 50)
 time_elapsed = []
-
+while True:
+    id_, batch = next(ds_train_iter)
 # the + 1 is because for some reason it crashes at the end otherwise. why? idk/
 for n in range(config['optimizer']['num_train_steps']+100):
     st = time.time()
@@ -387,7 +528,8 @@ for n in range(config['optimizer']['num_train_steps']+100):
             print("Done 1 epoch", flush=True)
 
             save_checkpoint(state, path=config['device']['output_dir'], no_optimizer=True)
-            # val_info = val_epoch(state)
+            val_info = val_epoch(state)
+            print(val_info)
             # print(f"Saving @iter {n:03d}.\nInfo: {pd.Series(val_info)}\n~\n", flush=True)
             # if wandb is not None:
             #     wandb.log({k + '_val': v for k, v in val_info.items()}, step=step_for_logging, commit=True)
