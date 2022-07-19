@@ -113,7 +113,7 @@ config['data']['random_scale_min'] = 1.0
 config['data']['num_speaker_turns'] = 7
 config['data']['segments_per_st'] = 7
 
-config['device']['batch_size'] = 32
+config['device']['batch_size'] = 8
 config['device']['prefetch_size'] = 0
 config['device']['n_fns_per_cycle'] = 256
 
@@ -507,8 +507,6 @@ def val_epoch(state: train_state.TrainState):
 train_metrics = []
 log_every = config['device'].get('commit_every_nsteps', 50)
 time_elapsed = []
-while True:
-    id_, batch = next(ds_train_iter)
 # the + 1 is because for some reason it crashes at the end otherwise. why? idk/
 for n in range(config['optimizer']['num_train_steps']+100):
     st = time.time()
